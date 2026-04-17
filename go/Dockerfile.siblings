@@ -1,0 +1,154 @@
+# Local-siblings node build — opt-in via `USE_LOCAL_SIBLINGS=1 ./scripts/start-services.sh`.
+# Build context is tee/ (the parent of both tee-node/ and extension-examples/) so the on-disk
+# sibling tee-node can be compiled into the node instead of the pinned module version. This file
+# is selected through docker-compose.siblings.yaml; the default reproducible, self-contained,
+# pinned build lives in ./Dockerfile.
+#
+# DEVELOPMENT ONLY. It compiles whatever is checked out in the sibling tee-node working
+# tree, so the resulting image is not reproducible from a commit and its code hash cannot
+# be allow-listed on-chain; it also bakes MODE=1 (simulated attestation — see below).
+# Never push this image to a registry a Confidential Space VM deploys from: use
+# ./Dockerfile, which builds from the pinned module and bakes MODE=0.
+#
+# Context filtering: because the context root is tee/ — the shared parent, outside this
+# repo — a context-root .dockerignore would have to be created in someone's tee/ directory
+# and cannot be shipped here. What can be shipped is the per-Dockerfile ignore file BuildKit
+# looks for next to the Dockerfile, <dockerfile>.dockerignore: this file's neighbour
+# ./Dockerfile.siblings.dockerignore, which BuildKit uses *instead of* the context-root one
+# (they are never merged). That is the only context filter this build can carry, and it is
+# what keeps .env / config/ out of the context and out of the local build cache.
+# The legacy builder (DOCKER_BUILDKIT=0) honours no per-Dockerfile ignore file at all — for
+# this build it therefore filters nothing — which is the second reason the COPYs below name
+# individual paths instead of the repo root.
+
+# pin base image by digest so every build starts from the same bytes
+# go1.25.13 is the security floor for this build: the stdlib at this patch level is
+# clean under govulncheck. Keep it in step with ./Dockerfile and go/go.mod's toolchain
+# directive.
+FROM golang:1.25.13-trixie@sha256:1d7ec61c055b5e4c23bed5e87a0d4f6b543558b0c41744c74700a757e8cb4557 AS builder
+
+# commit timestamp, propagated through the build to clamp file mtimes and normalize embedded dates
+ARG SOURCE_DATE_EPOCH
+ENV SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH
+
+WORKDIR /build
+
+# apt normally resolves to whatever package versions the mirror serves at build time, so two builds days apart install different bytes
+# redirect apt at snapshot.debian.org keyed on SOURCE_DATE_EPOCH so every build installs the exact package set that existed at that instant
+# NOTE: taken verbatim from https://github.com/reproducible-containers/repro-sources-list.sh/blob/master/alternative/Dockerfile.debian-13
+RUN \
+  --mount=type=cache,target=/var/cache/apt,sharing=locked \
+  --mount=type=cache,target=/var/lib/apt,sharing=locked \
+  if [ "${SOURCE_DATE_EPOCH:-0}" -gt 0 ] 2>/dev/null; then \
+    : "${SOURCE_DATE_EPOCH:=$(stat --format=%Y /etc/apt/sources.list.d/debian.sources)}" && \
+    snapshot="$(/bin/bash -euc "printf \"%(%Y%m%dT%H%M%SZ)T\n\" \"${SOURCE_DATE_EPOCH}\"")" && \
+    : "Enabling snapshot" && \
+    sed -i -e '/Types: deb/ a\Snapshot: true' /etc/apt/sources.list.d/debian.sources && \
+    : "Enabling cache" && \
+    rm -f /etc/apt/apt.conf.d/docker-clean && \
+    echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' >/etc/apt/apt.conf.d/keep-cache && \
+    : "Fetching the snapshot and installing ca-certificates in one command" && \
+    : "Check-Valid-Until is off because old snapshots have expired Release freshness stamps;" && \
+    : "package integrity still comes from the GPG-signed Release files. TLS peer verification" && \
+    : "stays ON (upstream disables it for bases without a CA store; this digest-pinned golang" && \
+    : "base already ships ca-certificates)." && \
+    apt-get install --update --snapshot "${snapshot}" -o Acquire::Check-Valid-Until=false -y ca-certificates && \
+    : "Installing ca-certificates" && \
+    apt-get install --snapshot "${snapshot}" -y ca-certificates && \
+    : "Clean up for improving reproducibility (optional)" && \
+    rm -rf /var/log/* /var/cache/ldconfig/aux-cache; \
+  else \
+    apt-get update && apt-get install -y ca-certificates && \
+    rm -rf /var/log/* /var/cache/ldconfig/aux-cache; \
+  fi
+
+# the sibling tee-node module in full — it is the module being developed, and the replace
+# directive below resolves against it
+# explicit chmod/chown on COPY so file metadata does not depend on host umask or ownership
+COPY --chmod=644 --chown=0:0 tee-node/ ./tee-node/
+
+# The Go module lives in go/ within this repo; language directories are siblings of it.
+WORKDIR /build/extension-examples/activity-reward-extension/go
+
+# From the extension repo, copy only the Go module's manifest and its own source packages —
+# never the repo root. A blanket `COPY extension-examples/activity-reward-extension/ ./…`
+# would drag .env, .env.<chain>, config/extension.env and config/proxy/*.toml (live indexer
+# DB credentials in a real working copy) into a builder layer and into the local build
+# cache; a multi-stage build keeps those bytes out of the final image but not out of the
+# cache. It would also copy the generated go.work, which `go` finds by walking up from this
+# module dir and whose `use ../../tee-proxy` entry does not exist inside the container.
+# The per-Dockerfile .dockerignore excludes all of that too; listing paths here is what
+# still holds when no per-Dockerfile ignore file is honoured (DOCKER_BUILDKIT=0).
+#
+# Manifest first, so `go mod download` is cached independently of source edits.
+COPY --chmod=644 --chown=0:0 extension-examples/activity-reward-extension/go/go.mod \
+                             extension-examples/activity-reward-extension/go/go.sum ./
+
+# The committed go.mod pins tee-node to a released version (see ./Dockerfile); point it at the
+# on-disk sibling for this dev build. -mod=mod lets go reconcile go.sum against the sibling's
+# dependency tree in-layer without mutating the committed go.sum on the host.
+# Path is relative to the module dir: go/ -> activity-reward-extension -> extension-examples -> /build.
+RUN go mod edit -replace github.com/flare-foundation/tee-node=../../../tee-node
+
+RUN GOFLAGS=-mod=mod go mod download
+
+# The module's own source packages (cmd/docker is the node entrypoint).
+COPY --chmod=644 --chown=0:0 extension-examples/activity-reward-extension/go/cmd/ ./cmd/
+COPY --chmod=644 --chown=0:0 extension-examples/activity-reward-extension/go/internal/ ./internal/
+COPY --chmod=644 --chown=0:0 extension-examples/activity-reward-extension/go/pkg/ ./pkg/
+
+# -trimpath strips build-host paths from the binary
+# -buildid= clears go's non-deterministic build id
+# -s -w drop symbol and dwarf tables, which contain build-time data
+# -buildvcs=false omits embedded vcs metadata
+# CGO_ENABLED=0 produces a static binary, avoiding link-time libc variance
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOFLAGS="-buildvcs=false -mod=mod" \
+    go build -trimpath -ldflags="-buildid= -s -w" -o /app/extension-tee ./cmd/docker
+
+# NOTE: buildkit's rewrite-timestamp only clamps mtimes down to SOURCE_DATE_EPOCH (moby/buildkit#3180)
+# files older than SOURCE_DATE_EPOCH are left at their original non-deterministic mtime
+# touch every path to SOURCE_DATE_EPOCH explicitly so timestamps are normalized in both directions
+RUN if [ "${SOURCE_DATE_EPOCH:-0}" -gt 0 ] 2>/dev/null; then find /app -exec touch -h -d @${SOURCE_DATE_EPOCH} {} +; fi
+
+# empty base image so nothing outside these explicit copies ends up in the final layers
+# digest-pinned like the builder, and pinned to the same digest as ./Dockerfile: a floating
+# tag would let the final layers (and the code hash measured over them) drift between two
+# builds of the same commit, which defeats comparing this dev image against the pinned one
+FROM gcr.io/distroless/static@sha256:9197324ba51d9cd071af8505989365c006adf9d6d2067eada25aef00abbb5278
+
+WORKDIR /app
+
+# ca-certificates.crt is the tls trust store for outbound https (e.g. flare rpc, oauth)
+# re-apply chmod/chown on each COPY so metadata is pinned here and does not depend on whatever the builder stage left behind
+COPY --chmod=644 --chown=65532:65532 --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --chmod=755 --chown=65532:65532 --from=builder /app/extension-tee /app/extension-tee
+
+# MODE=0 is PRODUCTION attestation; MODE=1 is SIMULATED attestation, i.e. none at all.
+#
+# MODE=1 is the honest default for this image and only for this image: it compiles an
+# arbitrary on-disk tee-node checkout, so there is no reproducible code hash to allow-list
+# and nothing here is attestable. ./Dockerfile bakes MODE=0 for the same reason in reverse.
+# Treat an image built from this file as devnet-only: on a Confidential Space VM it would
+# present a simulated attestation token instead of a real one.
+ENV MODE=1 CONFIG_PORT=5501 SIGN_PORT=7701 EXTENSION_PORT=7702
+
+# match tee-node: run as root (USER 0:0) — the TEE workload itself is the isolation boundary
+USER 0:0
+
+# confidential space launch policy label: allow the operator to override these env vars at workload launch
+# without this, the confidential space VM rejects overrides at attestation time and the values baked here are final
+#
+# MODE is deliberately ABSENT, exactly as in ./Dockerfile. It selects the attestation
+# backend, and one rule for every image in this repo — MODE is fixed by the image, never by
+# whoever launches it — is what makes that rule enforceable and copy-safe: a file that lists
+# MODE here becomes a template for a production image whose attestation an operator can turn
+# off at launch. Keeping it out costs this dev image nothing, because local development sets
+# MODE through Docker Compose (`MODE=${MODE:-1}`), which the launch-policy label does not
+# govern. It also means this image cannot be talked into claiming production attestation on
+# a Confidential Space VM: MODE=1 is baked and unchangeable there, so the mismatch surfaces
+# instead of being flipped silently at launch.
+LABEL "tee.launch_policy.allow_env_override"="LOG_LEVEL,PROXY_URL,INITIAL_OWNER,EXTENSION_ID,CHAIN_URL,CONFIG_PORT,SIGN_PORT,EXTENSION_PORT"
+
+EXPOSE 5501 7701 7702
+
+CMD ["/app/extension-tee"]

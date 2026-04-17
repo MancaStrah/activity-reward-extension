@@ -1,0 +1,64 @@
+# Context filter for go/Dockerfile.siblings, whose build context is tee/ — the shared parent
+# of tee-node/ and extension-examples/ (see docker-compose.siblings.yaml).
+#
+# Why the filter has to live here, under this name: BuildKit looks for a per-Dockerfile
+# ignore file named <dockerfile>.dockerignore next to the Dockerfile it was given, and uses
+# it *instead of* the context-root .dockerignore — the two are never merged. Compose passes
+# the dockerfile as extension-examples/activity-reward-extension/go/Dockerfile.siblings, so
+# the file BuildKit reads is this one, and it happens to sit inside this repo. The
+# alternative, a context-root .dockerignore, would have to be created at tee/.dockerignore:
+# outside every repo, on every machine, and therefore not shippable. This is the only context
+# filter this build can carry with it.
+#
+# This file does not have to survive its own patterns: BuildKit reads it alongside the
+# Dockerfile, not out of the filtered context, so the deny-all below excludes it from the
+# context without disabling it.
+#
+# It is also only honoured by BuildKit. The legacy builder (DOCKER_BUILDKIT=0) reads nothing
+# but a context-root .dockerignore, i.e. nothing at all for this build — which is why
+# Dockerfile.siblings additionally COPYs individual paths instead of the repo root. Neither
+# half is sufficient alone: this file keeps credentials out of the context that is uploaded
+# to the daemon, the narrow COPYs keep them out of the builder layers and the local build
+# cache even when this file is not read.
+#
+# Every pattern below is relative to the context root (tee/), NOT to this file's directory.
+# `*` does not cross `/`; `**/foo` matches foo at any depth. The last matching pattern wins,
+# so order matters: a `!` re-inclusion must come after the exclusion it overrides.
+
+# Deny by default. The context is a developer's shared parent directory: it holds sibling
+# checkouts this build has no business reading (tee-proxy, e2e, other extensions), each with
+# its own .env files, credentials, node_modules and build output. Only the two inputs the
+# Dockerfile copies are added back, path by path — anything else that appears in tee/ later
+# stays out without this file having to know about it.
+*
+
+# The sibling tee-node module, copied in full: it is the module being developed here.
+!tee-node
+
+# The extension's Go module: manifest plus its own source packages. Everything else in the
+# repo stays excluded, notably .env, .env.<chain>, config/extension.env and
+# config/proxy/*.toml (indexer DB credentials in a real working copy), and the generated
+# go.work, whose `use` entries point at host paths that do not exist in the container.
+!extension-examples
+extension-examples/*
+!extension-examples/activity-reward-extension
+extension-examples/activity-reward-extension/*
+!extension-examples/activity-reward-extension/go
+extension-examples/activity-reward-extension/go/*
+!extension-examples/activity-reward-extension/go/go.mod
+!extension-examples/activity-reward-extension/go/go.sum
+!extension-examples/activity-reward-extension/go/cmd
+!extension-examples/activity-reward-extension/go/internal
+!extension-examples/activity-reward-extension/go/pkg
+
+# Re-excluded inside the trees added back above. A tee-node working copy has its own .env
+# and its own build/editor state; none of it is an input to a Go build. Listed after the
+# re-inclusions so these win.
+**/.env
+**/.env.*
+**/*.env
+**/.DS_Store
+**/node_modules/
+**/.venv/
+**/dist/
+tee-node/.git

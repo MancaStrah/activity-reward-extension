@@ -1,0 +1,12 @@
+[profile.default]
+src = "contracts"
+out = "out"
+libs = ["lib"]
+# TODO: Once flare-smart-contracts-v2 is published as a package, add it as a dependency
+# and restore the remapping:
+#   remappings = ["flare-smart-contracts-v2=lib/flare-smart-contracts-v2"]
+via-ir = true
+# Pin one compiler: with only `pragma ^0.8.27`, artifacts and local builds were
+# produced by different 0.8.x versions, which breaks bytecode comparability
+# (deployed-bytecode verification needs the exact compiler).
+solc = "0.8.27"

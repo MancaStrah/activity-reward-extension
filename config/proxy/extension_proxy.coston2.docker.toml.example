@@ -1,0 +1,67 @@
+# Docker-specific Coston2 proxy config. Service names instead of localhost.
+redis_port = "redis:6379"
+private_key_variable = "PROXY_PRIVATE_KEY"
+initial_signing_policy_offset = 2
+signing_policy_fetch_interval = "20s"
+
+chain_id = 114
+
+[db]
+host = "<indexer-db-host>"
+port = 3306
+database = "<indexer-db-name>"
+username = "<indexer-db-user>"
+password = "<indexer-db-password>"
+log_queries = false
+
+[addresses]
+flare_systems_manager = "0xA90Db6D10F856799b10ef2A77EBCbF460aC71e52"
+relay = "0xa10B672D1c62e5457b17af63d4302add6A99d7dE"
+voter_registry = "0x6a0AF07b7972177B176d3D422555cbc98DfDe914"
+
+
+[ports]
+internal = "6663"
+external = "6664"
+
+[info_timing]
+cycle_internal = "10s"
+cycle_queue_response_wait = "2s"
+
+[voting]
+proposal_expiration = "12s"
+max_pending_request = 10000
+
+[attestation]
+# Fail-closed bootstrap: verify the TEE's Confidential Space attestation instead of
+# trusting whichever machine answers the bootstrap challenge first. Omitting this
+# section defaults to enable=false upstream — an insecure bootstrap.
+#
+# CAUTION: every check below is SKIPPED, not reported as a misconfiguration, when
+# its value is left empty — an empty list, an empty string, max_token_age = 0 or
+# require_sec_boot = false silently disables that one check. Fill in each
+# <placeholder> from your own build/deployment; TEE_PROFILE=confidential-space
+# refuses to start until all of them are meaningfully set.
+enable = true
+# The aud claim the Confidential Space token must carry: the audience this
+# deployment requested when the TEE fetched its token. Empty string = no check.
+audience = "<attestation-token-audience>"
+# The codeHash(es) this extension's governance allow-listed via allow-tee-version,
+# measured from YOUR OWN build — never copied from a running proxy. Empty list = no check.
+# expected_code_hashes = ["sha256:<measured-image-code-hash>"]
+# The hwmodel value(s) the TEE runs on; must match the machine type you deploy
+# ("INTEL_TDX_VM" for a TDX machine). Empty list = no check.
+expected_platforms = ["AMD_SEV_SNP_VM"]
+# The dbgstat value(s) accepted. Empty list = no check, which would admit a
+# debuggable TEE whose memory the host can inspect.
+expected_debug_statuses = ["disabled-since-boot"]
+# Reject attestation tokens older than this. 0 = no freshness check (replayable).
+max_token_age = "5m"
+# Require a verified boot chain. false = no secure-boot check.
+require_sec_boot = true
+# Never accept the tee-node "magic_pass" sentinel on a real deployment
+# (TEE_PROFILE=confidential-space keeps this false and REQUIRES every pin above).
+# For a simulated local-Docker run against this testnet
+# (TEE_PROFILE=testnet-sim, MODE=1) set allow_magic_pass = true, or the
+# bootstrap can never complete.
+allow_magic_pass = false

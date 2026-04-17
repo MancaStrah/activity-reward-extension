@@ -1,0 +1,83 @@
+node_modules/
+dist/
+
+# Env files hold private keys — never commit them. Examples and language
+# manifests are the two deliberate exceptions (language.env is what makes a
+# directory a discoverable extension implementation).
+.env*
+*.env
+!*.example
+!language.env
+!*/language.env
+
+# Proxy configs can contain DB credentials — ignore ALL of them by default and
+# allowlist only the known credential-free files. Deny-by-default is what makes
+# this safe: an exact-name deny list misses every variant a tool or editor can
+# create, such as a Finder duplicate named "extension_proxy.coston2.docker copy.toml".
+# (.example files don't match *.toml and stay committed.)
+config/proxy/*.toml
+!config/proxy/extension_proxy.toml
+!config/proxy/extension_proxy.docker.toml
+
+config/**/*.log
+config/register-tee.state
+
+out/
+cache/
+.DS_Store
+
+# go.work is generated on demand by start-services.sh for USE_LOCAL_SIBLINGS=1
+go.work
+go.work.sum
+
+# Compiled Go binaries. `go build ./cmd/X` run from tools/ drops the binary at
+# tools/X, so this list needs one prefix per command name — a maintenance trap that
+# has already let a platform-specific Mach-O binary get committed once. When you add
+# a tools/cmd/<name>, add its prefix here in the same change.
+tools/check-*
+tools/start-*
+tools/allow-*
+tools/deploy-*
+tools/register-*
+tools/run-*
+tools/verify-*
+tools/query-*
+tools/set-*
+tools/audit-*
+tools/test-*
+tools/claim-*
+tools/encrypt-*
+tools/get-*
+
+# Generated contract bindings (produced by scripts/generate-bindings.sh).
+#
+# The bindings for this extension's own contract are COMMITTED on purpose, so the
+# negations below are the rule and the patterns above them are the fallback: without
+# committed bindings, `go build ./tools/...` needs Foundry and a Solidity compile just
+# to typecheck. CI regenerates them before vet and the tests, so a binding that has
+# gone stale against contracts/ fails there rather than passing quietly. Bindings for
+# any other contract directory are pure build output and stay ignored.
+tools/pkg/contracts/*/autogen.go
+tools/pkg/contracts/*/*.abi
+tools/pkg/contracts/*/*.bin
+!tools/pkg/contracts/strava/autogen.go
+!tools/pkg/contracts/strava/StravaInstructionSender.abi
+!tools/pkg/contracts/strava/StravaInstructionSender.bin
+
+# Compiled extension binary — `go build ./cmd/start-tee` output. Build it locally;
+# a committed platform-specific binary goes stale against its own source silently.
+go/start-tee
+
+# Private deployment guide: the per-operator notes for a live deployment (SSH
+# access to the Confidential Space VM, redeploy steps, host names). The public
+# runbook is docs/deployment-steps.md; this one is prose about how to reach real
+# infrastructure, which secret scanning does not catch because it holds no
+# secrets — only the directions to them.
+DEPLOYMENT.md
+
+# Scratch working notes — drafts, paste buffers, half-finished investigations.
+notes/
+
+# Locally checked-out tooling that lives under docs/ but is not part of this
+# repo's documentation set.
+docs/superpowers

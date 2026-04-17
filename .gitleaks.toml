@@ -1,0 +1,92 @@
+# gitleaks configuration for the CI secret-scan job (.github/workflows/ci.yml).
+#
+# The default ruleset is kept in full — this file only adds narrow allowlists for
+# values that are provably not secrets. Each entry pins an exact literal rather
+# than muting a rule, a path, or a file type, so a real key landing in any of
+# these same files is still reported.
+#
+# Rationale: the secret-scan job needs to keep catching real secrets. A gate
+# that is permanently red gets ignored, and a broadly-muted gate silently stops
+# working; both defeat the point. Anything added here needs a comment saying
+# why the value cannot authorize anything.
+#
+# ---------------------------------------------------------------------------
+# THE FORM OF THIS FILE IS LOAD-BEARING. Read before editing.
+#
+# This used to declare its entries as `[[allowlists]]` — the plural,
+# array-of-tables form. At global scope that key does not exist in the pinned
+# gitleaks version, and gitleaks does not warn about a config key it does not
+# recognise: it loads the file, ignores the whole block, and scans as if no
+# allowlist had been written. The gate had therefore never once been green, and
+# nothing in the repo said so, because the check was believed-passing rather
+# than run.
+#
+# Proven by A/B against gitleaks v8.24.3 with identical allowlist content:
+#
+#   [[allowlists]]  (plural, what this file used to say)  ->  leaks found: 1
+#   [allowlist]     (singular, below)                     ->  no leaks found
+#
+# Global scope allows exactly ONE `[allowlist]` table, so every literal has to
+# live in this one block and path-scoping per entry is not available here. That
+# is the trade for having the file work at all. Rule-level
+# `[[rules.allowlists]]` would restore per-entry scoping, but only by redeclaring
+# the default rules this config deliberately inherits whole.
+#
+# Verify a change to this file — do not assume it took effect:
+#
+#   docker run --rm -v "$PWD:/repo" -w /repo \
+#       zricethezav/gitleaks@sha256:e1b35e12a8c6fa8901f060459cfb6b2fc4c484d3afbe3b029733a3bbfab07055 \
+#       git --log-opts=--all -c .gitleaks.toml --redact --no-banner
+#
+# That digest is v8.24.3. It is written as a digest rather than as the tag on
+# purpose, and CI runs this line unchanged: a tag is mutable, so documenting the
+# tag here while the workflow pins the digest would let a local "verified" run and
+# the gate be two different scanners — the one thing this command exists to rule
+# out.
+#
+# It must report 0 leaks over every reachable commit. A run that reports "1
+# commit scanned" is not scanning the history — see the --log-opts flag in the
+# workflow.
+# ---------------------------------------------------------------------------
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = """
+Exact non-secret literals, each listed with why it cannot authorize anything.
+regexTarget = "secret" matches against the value a rule captured, not the whole
+line, so each entry is anchored to one complete value and nothing else.
+
+1. ac0974...ff80 — Hardhat/Anvil devnet account 0 private key. Published
+   verbatim in both projects' own documentation and shipped in every install, so
+   it is a public test vector, not a credential: it has funds only on a
+   freshly-started local devnet. Occurs once per Go module
+   (tools/pkg/configs/configs.go and go/cmd/start-tee/main.go; they are separate
+   modules and cannot share a constant without coupling the extension image to
+   the deployment tooling). Both call sites gate its use behind an explicit
+   LOCAL_MODE=true opt-in and fail closed otherwise, so it can never become an
+   owner or signer on a public chain.
+
+2. abcdef12... and 12345678... — sequential placeholder literals used as
+   key-shaped inputs by the validate package's unit tests, which assert that a
+   *set* variable is not the dev key and that a missing 0x prefix is rejected.
+   Both are ascending-hex patterns with no entropy, correspond to no account
+   anyone controls, and are only ever written to a t.TempDir() fixture or an env
+   var inside the test process.
+
+3. 0x256cd8c8... — the token-grant keccak domain vector, asserted identically in
+   go/internal/extension/grant_test.go and tools/pkg/fccutils/grant_test.go so
+   that the encoder and decoder cannot drift apart. It is the OUTPUT of a hash
+   over a fixed public string, not an input to anything: there is no key it
+   corresponds to and no operation it authorizes. It was never listed here
+   before, so even with the form above corrected the gate would have stayed red
+   on these two lines.
+"""
+regexTarget = "secret"
+regexes = [
+  '''^ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80$''',
+  '''^abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890$''',
+  '''^1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef$''',
+  '''^0x256cd8c88ece698e6d32e2a83ce4c75aa7177ab40fd7287a7e3b289e8ee56f40$''',
+]

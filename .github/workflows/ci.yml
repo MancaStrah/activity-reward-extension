@@ -1,0 +1,185 @@
+# CI security gates:
+# forge fmt/build/test, go vet + race tests + govulncheck for both modules,
+# shell syntax + the profile-matrix tests + version-pin consistency,
+# gitleaks secret scanning over the full history, and a double build of
+# go/Dockerfile whose two image IDs must match.
+#
+# Third-party actions are pinned to commit SHAs, not tags: a tag is mutable, so
+# `@v4` lets whoever controls that repo change what runs here — including in the
+# secret-scan and image-build jobs, whose output these checks rely on as
+# evidence. The trailing comment records the human-readable version the
+# SHA corresponded to when pinned. govulncheck is pinned for the same reason plus
+# reproducibility: an unpinned tool version means the recorded scan results in
+# docs/security/ cannot be re-derived. Re-pin deliberately when upgrading.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  solidity:
+    name: Solidity (fmt, build, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
+      - run: forge fmt --check
+      - run: forge build --sizes
+      - run: forge test -vvv
+
+  go-extension:
+    name: Go extension (vet, race tests, govulncheck)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: go
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go/go.mod
+      - run: go vet ./...
+      - run: go test -race ./...
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+          govulncheck ./...
+
+  go-tools:
+    name: Go tools (bindings, vet, race tests, govulncheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # Bindings (tools/pkg/contracts/*/autogen.go) are committed; regenerating them
+      # here makes vet and the tests run against contracts/ as it is now, so bindings
+      # that have gone stale show up instead of passing quietly.
+      - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: tools/go.mod
+      - run: ./scripts/generate-bindings.sh
+      - run: go vet ./...
+        working-directory: tools
+      - run: go vet -tags integration ./integration/
+        working-directory: tools
+      - run: go test -race ./...
+        working-directory: tools
+      - name: govulncheck
+        working-directory: tools
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+          govulncheck ./...
+
+  scripts:
+    name: Shell (syntax, profile matrix, version pins)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # Go is needed here, not incidentally: the proxy-config pre-flight is
+      # tools/cmd/check-proxy-config, which reads the config with the PROXY's own
+      # parser and schema instead of shell regexes. profile.sh builds it on first
+      # use, so the matrix cannot run without a toolchain.
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: tools/go.mod
+      - name: bash -n every script
+        run: |
+          set -e
+          for f in scripts/*.sh scripts/lib/*.sh; do bash -n "$f"; done
+      # Fail-fast matrix: local sim validates, real profile requires
+      # MODE=0 and refuses magic_pass configs.
+      - run: ./scripts/test-profile-matrix.sh
+      # Dependency pins + launch-label/doc consistency.
+      - run: ./scripts/check-versions.sh
+      # The docs standard, including the gate that compares the documented Solidity
+      # test count with test/*.sol. It existed and passed for months without running
+      # here, and the count had drifted to 31 against a tree of 33 — the same shape
+      # as the secret-scan job that was believed-passing rather than run. A gate
+      # nobody runs is not a gate.
+      - run: ./scripts/check-docs.sh
+
+  secret-scan:
+    name: Secret scan (gitleaks, full history)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Makes the history available. On its own it does NOT widen the scan —
+          # see --log-opts below, which is the part that actually reads it.
+          fetch-depth: 0
+      # Runs the gitleaks CLI directly instead of gitleaks-action, for two reasons
+      # this job was previously wrong about:
+      #
+      #   1. The action resolves the scanner version at run time, so the binary
+      #      producing this evidence was not pinned even though the action's own
+      #      commit was. Everything else in this repo is digest-pinned and the
+      #      header above argues why; the tool whose output gates a merge cannot
+      #      be the exception.
+      #   2. On a push event the action scans the pushed range, not the history.
+      #      The job was named "full history" while its log said "1 commit
+      #      scanned". --log-opts=--all is what makes the name true, and it
+      #      reaches commits that are reachable but not on the branch.
+      #
+      # This is byte-for-byte the command documented in .gitleaks.toml, so a local
+      # verification and this gate cannot disagree. --redact keeps a real finding
+      # out of a public log while still naming the rule, file and line.
+      - name: gitleaks (pinned by digest, whole history)
+        run: |
+          docker run --rm -v "$PWD:/repo" -w /repo \
+            zricethezav/gitleaks@sha256:e1b35e12a8c6fa8901f060459cfb6b2fc4c484d3afbe3b029733a3bbfab07055 \
+            git --log-opts=--all -c .gitleaks.toml --redact --no-banner
+
+  image-build:
+    name: Reproducible image build (double build, digest compare)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          driver: docker-container
+      # A single build only proves the Dockerfile compiles. To say anything about
+      # determinism the same commit has to be built twice and the two image IDs
+      # compared, so a non-deterministic layer fails here instead of surfacing when
+      # someone tries to re-derive a registered codeHash.
+      #
+      # The two invocations share one shell function so the recipe cannot drift
+      # between them; only the flags at the call sites differ. The second build
+      # passes --no-cache so it is a genuine rebuild rather than a cache hit on the
+      # first one — which roughly doubles this job's runtime.
+      #
+      # This is still the weaker form of the check: one runner, one kernel, one
+      # BuildKit instance. A reproducibility claim needs two independent machines;
+      # REPRODUCIBILITY.md documents that procedure.
+      - name: Build twice with pinned SOURCE_DATE_EPOCH and compare image IDs
+        run: |
+          set -euo pipefail
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          echo "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH"
+
+          build() {
+            docker buildx build --platform linux/amd64 "$@" \
+              --build-arg SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
+              --output "type=docker,rewrite-timestamp=true" \
+              --load -f go/Dockerfile .
+          }
+
+          build -t local/activity-reward-extension:ci-1
+          build --no-cache -t local/activity-reward-extension:ci-2
+
+          id1=$(docker inspect --format='{{.Id}}' local/activity-reward-extension:ci-1)
+          id2=$(docker inspect --format='{{.Id}}' local/activity-reward-extension:ci-2)
+          echo "build 1 image id: $id1"
+          echo "build 2 image id: $id2"
+
+          if [ "$id1" != "$id2" ]; then
+            echo "ERROR: two builds of the same commit produced different image ids" >&2
+            echo "  build 1: $id1" >&2
+            echo "  build 2: $id2" >&2
+            exit 1
+          fi
+          echo "reproducible image id: $id1"

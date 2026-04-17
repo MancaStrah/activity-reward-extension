@@ -1,0 +1,25 @@
+# Docker Compose override for Coston2 deployment.
+# Usage: docker compose -f docker-compose.yaml -f docker-compose.coston2.yaml up
+services:
+  ext-proxy:
+    volumes:
+      - ./config/proxy/extension_proxy.coston2.docker.toml:/app/config/config.toml:ro
+    # The internal queue API (container port 6663) has no application auth, so
+    # on public-testnet profiles it is not published to the host at all — the
+    # TEE reaches it over this compose file's dedicated network. `!override`
+    # (compose >= 2.24) replaces the base mapping instead of merging with it.
+    ports: !override
+      - "${EXT_PROXY_EXTERNAL_BIND:-0.0.0.0:6674}:6664"
+
+  extension-tee:
+    environment:
+      - CHAIN_URL=${CHAIN_URL:-https://coston2-api.flare.network/ext/C/rpc}
+      # Coston2 chain id. The node binds every signature to this value; it must
+      # match the proxy's chain_id (114) and the on-chain registry, or signature
+      # verification fails (InvalidTeePublicKeyOrSignature / proxy panic).
+      - CHAIN_ID=${CHAIN_ID:-114}
+
+networks:
+  default:
+    name: ${COMPOSE_NETWORK:-activity-reward-extension-coston2}
+    external: false
